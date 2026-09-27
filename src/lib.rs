@@ -183,6 +183,38 @@ fn maybe_get_obj<'a>(doc: &'a Document, dict: &'a Dictionary, key: &[u8]) -> Opt
     dict.get(key).map(|o| maybe_deref(doc, o)).ok()
 }
 
+/// Resolve a `BMC`/`BDC` operator's properties operand, which is either an inline
+/// dictionary or a name referencing an entry in the page's `/Properties` resource.
+/// Returns `None` for `BMC` (no properties operand), or for a name that doesn't
+/// resolve to a dictionary.
+fn marked_content_properties<'a>(doc: &'a Document, resources: &'a Dictionary, operands: &'a [Object]) -> Option<&'a Dictionary> {
+    match operands.get(1)? {
+        Object::Dictionary(d) => Some(d),
+        Object::Name(name) => {
+            let props = maybe_get_obj(doc, resources, b"Properties")?.as_dict().ok()?;
+            maybe_get_obj(doc, props, name)?.as_dict().ok()
+        }
+        _ => None,
+    }
+}
+
+/// Pull `/MCID` (PDF 32000-1:2008, 14.6) out of a resolved marked-content properties
+/// dictionary. `/MCID` is how a marked-content span in a content stream is linked back
+/// to the semantic structure tree (`/StructTreeRoot`) of a tagged PDF.
+pub fn mcid(properties: Option<&Dictionary>) -> Option<i64> {
+    match properties?.get(b"MCID").ok()? {
+        Object::Integer(i) => Some(*i),
+        _ => None,
+    }
+}
+
+/// Whether a `BMC`/`BDC` tag marks content as an artifact (PDF 32000-1:2008, 14.8.2.2)
+/// -- page furniture like headers, footers, and page numbers that is explicitly
+/// excluded from the structure tree and normally carries no `/MCID`.
+pub fn is_artifact(tag: Option<&str>) -> bool {
+    tag == Some("Artifact")
+}
+
 // an intermediate trait that can be used to chain conversions that may have failed
 trait FromOptObj<'a> {
     fn from_opt_obj(doc: &'a Document, obj: Option<&'a Object>, key: &[u8]) -> Self;
@@ -1852,10 +1884,18 @@ impl<'a> Processor<'a> {
                     path.ops.clear();
                 }
                 "BMC" | "BDC" => {
+                    // `Object::Name` holds raw bytes (PDF names aren't guaranteed
+                    // valid UTF-8, though in practice they always are); degrade to
+                    // `None` rather than panicking on the rare non-UTF-8 name.
+                    let tag = operation.operands.first().and_then(|o| o.as_name().ok())
+                        .and_then(|name| std::str::from_utf8(name).ok());
+                    let properties = marked_content_properties(doc, resources, &operation.operands);
+                    output.begin_marked_content(tag, properties)?;
                     mc_stack.push(operation);
                 }
                 "EMC" => {
                     mc_stack.pop();
+                    output.end_marked_content()?;
                 }
                 "Do" => {
                     // `Do` process an entire subdocument, so we do a recursive call to `process_stream`
@@ -1885,6 +1925,16 @@ pub trait OutputDev {
     fn end_line(&mut self)-> Result<(), OutputError>;
     fn stroke(&mut self, _ctm: &Transform, _colorspace: &ColorSpace, _color: &[f64], _path: &Path)-> Result<(), OutputError> {Ok(())}
     fn fill(&mut self, _ctm: &Transform, _colorspace: &ColorSpace, _color: &[f64], _path: &Path)-> Result<(), OutputError> {Ok(())}
+    /// Called on `BMC`/`BDC`, i.e. when a marked-content sequence begins. `tag` is the
+    /// operator's tag name (e.g. `Span`, `Artifact`); see [`is_artifact`]. `properties`
+    /// is the resolved properties dictionary for `BDC` (`None` for `BMC`, or if
+    /// resolution fails); see [`mcid`] for the common case of pulling `/MCID` out of
+    /// it. Always paired with a matching [`OutputDev::end_marked_content`] call, even
+    /// when `tag`/`properties` could not be resolved.
+    fn begin_marked_content(&mut self, _tag: Option<&str>, _properties: Option<&Dictionary>) -> Result<(), OutputError> {Ok(())}
+    /// Called on `EMC`, closing the marked-content sequence most recently opened by
+    /// [`OutputDev::begin_marked_content`].
+    fn end_marked_content(&mut self) -> Result<(), OutputError> {Ok(())}
 }
 
 
@@ -2419,3 +2469,190 @@ fn output_doc_inner<'a>(page_num: u32, object_id: ObjectId, doc: &'a Document, p
     output.end_page()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod marked_content_tests {
+    use super::*;
+    use lopdf::content::{Content, Operation};
+
+    /// Build a one-page PDF whose content stream is exactly `operations`, optionally
+    /// with a `/Properties` resource dictionary (for the named-reference form of a
+    /// `BDC` properties operand). Mirrors the scaffold in the `/ActualText` tests (see
+    /// PR #149): minimal Type1/Helvetica font, single page, no text drawing required
+    /// since these tests only care about marked-content bracketing.
+    fn build_pdf(operations: Vec<Operation>, properties_resource: Option<Dictionary>) -> Vec<u8> {
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+
+        let mut font = Dictionary::new();
+        font.set("Type", "Font");
+        font.set("Subtype", "Type1");
+        font.set("BaseFont", "Helvetica");
+        let font_id = doc.add_object(font);
+
+        let mut fonts = Dictionary::new();
+        fonts.set("F1", Object::Reference(font_id));
+        let mut resources = Dictionary::new();
+        resources.set("Font", Object::Dictionary(fonts));
+        if let Some(props) = properties_resource {
+            resources.set("Properties", Object::Dictionary(props));
+        }
+        let resources_id = doc.add_object(resources);
+
+        let content = Content { operations };
+        let content_id = doc.add_object(Stream::new(Dictionary::new(), content.encode().unwrap()));
+
+        let mut page = Dictionary::new();
+        page.set("Type", "Page");
+        page.set("Parent", Object::Reference(pages_id));
+        page.set("Contents", Object::Reference(content_id));
+        page.set("Resources", Object::Reference(resources_id));
+        page.set("MediaBox", Object::Array(vec![0.into(), 0.into(), 612.into(), 792.into()]));
+        let page_id = doc.add_object(page);
+
+        let mut pages = Dictionary::new();
+        pages.set("Type", "Pages");
+        pages.set("Kids", Object::Array(vec![Object::Reference(page_id)]));
+        pages.set("Count", 1);
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", "Catalog");
+        catalog.set("Pages", Object::Reference(pages_id));
+        let catalog_id = doc.add_object(catalog);
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).unwrap();
+        buf
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Event {
+        Begin { tag: Option<String>, mcid: Option<i64>, is_artifact: bool },
+        End,
+    }
+
+    /// An `OutputDev` that records only marked-content bracketing, ignoring text and
+    /// path output entirely, so assertions read as a flat event list.
+    struct EventRecorder {
+        events: Vec<Event>,
+    }
+
+    impl OutputDev for EventRecorder {
+        fn begin_page(&mut self, _page_num: u32, _media_box: &MediaBox, _art_box: Option<(f64, f64, f64, f64)>) -> Result<(), OutputError> {Ok(())}
+        fn end_page(&mut self) -> Result<(), OutputError> {Ok(())}
+        fn output_character(&mut self, _trm: &Transform, _width: f64, _spacing: f64, _font_size: f64, _char: &str) -> Result<(), OutputError> {Ok(())}
+        fn begin_word(&mut self) -> Result<(), OutputError> {Ok(())}
+        fn end_word(&mut self) -> Result<(), OutputError> {Ok(())}
+        fn end_line(&mut self) -> Result<(), OutputError> {Ok(())}
+        fn begin_marked_content(&mut self, tag: Option<&str>, properties: Option<&Dictionary>) -> Result<(), OutputError> {
+            self.events.push(Event::Begin {
+                tag: tag.map(|s| s.to_owned()),
+                mcid: mcid(properties),
+                is_artifact: is_artifact(tag),
+            });
+            Ok(())
+        }
+        fn end_marked_content(&mut self) -> Result<(), OutputError> {
+            self.events.push(Event::End);
+            Ok(())
+        }
+    }
+
+    fn record_events(pdf: &[u8]) -> Vec<Event> {
+        let doc = Document::load_mem(pdf).expect("load synthetic pdf");
+        let mut rec = EventRecorder { events: vec![] };
+        output_doc(&doc, &mut rec).expect("process synthetic pdf");
+        rec.events
+    }
+
+    #[test]
+    fn inline_mcid_surfaces() {
+        let mut props = Dictionary::new();
+        props.set("MCID", 3);
+        let ops = vec![
+            Operation::new("BDC", vec!["P".into(), Object::Dictionary(props)]),
+            Operation::new("EMC", vec![]),
+        ];
+        let events = record_events(&build_pdf(ops, None));
+        assert_eq!(events, vec![
+            Event::Begin { tag: Some("P".into()), mcid: Some(3), is_artifact: false },
+            Event::End,
+        ]);
+    }
+
+    #[test]
+    fn named_properties_mcid_resolves() {
+        let mut mc0 = Dictionary::new();
+        mc0.set("MCID", 7);
+        let mut properties_resource = Dictionary::new();
+        properties_resource.set("MC0", Object::Dictionary(mc0));
+
+        let ops = vec![
+            Operation::new("BDC", vec!["Span".into(), Object::Name(b"MC0".to_vec())]),
+            Operation::new("EMC", vec![]),
+        ];
+        let events = record_events(&build_pdf(ops, Some(properties_resource)));
+        assert_eq!(events, vec![
+            Event::Begin { tag: Some("Span".into()), mcid: Some(7), is_artifact: false },
+            Event::End,
+        ]);
+    }
+
+    /// `BMC` has no properties operand at all (unlike `BDC`); resolution must degrade
+    /// to `None` rather than panicking on the missing operand.
+    #[test]
+    fn bare_bmc_has_no_properties() {
+        let ops = vec![
+            Operation::new("BMC", vec!["Span".into()]),
+            Operation::new("EMC", vec![]),
+        ];
+        let events = record_events(&build_pdf(ops, None));
+        assert_eq!(events, vec![
+            Event::Begin { tag: Some("Span".into()), mcid: None, is_artifact: false },
+            Event::End,
+        ]);
+    }
+
+    /// `/Artifact` content (headers, footers, page furniture) is explicitly excluded
+    /// from the structure tree and normally carries no `/MCID`.
+    #[test]
+    fn artifact_tag_detected() {
+        let mut props = Dictionary::new();
+        props.set("Type", "Pagination");
+        let ops = vec![
+            Operation::new("BDC", vec!["Artifact".into(), Object::Dictionary(props)]),
+            Operation::new("EMC", vec![]),
+        ];
+        let events = record_events(&build_pdf(ops, None));
+        assert_eq!(events, vec![
+            Event::Begin { tag: Some("Artifact".into()), mcid: None, is_artifact: true },
+            Event::End,
+        ]);
+    }
+
+    /// Nested marked content must produce exactly one begin/end pair per bracket, in
+    /// correctly nested order -- not just resolve correctly in the non-nested case.
+    #[test]
+    fn nested_marked_content_stays_balanced() {
+        let mut outer = Dictionary::new();
+        outer.set("MCID", 0);
+        let mut inner = Dictionary::new();
+        inner.set("MCID", 1);
+        let ops = vec![
+            Operation::new("BDC", vec!["P".into(), Object::Dictionary(outer)]),
+            Operation::new("BDC", vec!["Span".into(), Object::Dictionary(inner)]),
+            Operation::new("EMC", vec![]),
+            Operation::new("EMC", vec![]),
+        ];
+        let events = record_events(&build_pdf(ops, None));
+        assert_eq!(events, vec![
+            Event::Begin { tag: Some("P".into()), mcid: Some(0), is_artifact: false },
+            Event::Begin { tag: Some("Span".into()), mcid: Some(1), is_artifact: false },
+            Event::End,
+            Event::End,
+        ]);
+    }
+}
+
