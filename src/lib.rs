@@ -1055,10 +1055,12 @@ impl<'a> PdfCIDFont<'a> {
                     }
                     i += 2;
                 } else {
+                    // c_first c_last w -- a single width applied to every CID in
+                    // [c_first, c_last] inclusive (PDF32000-1:2008 9.7.4.3).
                     let c_first = w[i].as_i64().expect("first should be num");
-                    let c_last = w[i].as_i64().expect("last should be num");
-                    let c_width = as_num(&w[i]);
-                    for id in c_first..c_last {
+                    let c_last = w[i+1].as_i64().expect("last should be num");
+                    let c_width = as_num(&w[i+2]);
+                    for id in c_first..=c_last {
                         widths.insert(id as CharCode, c_width);
                     }
                     i += 3;
@@ -2656,3 +2658,126 @@ mod marked_content_tests {
     }
 }
 
+
+#[cfg(test)]
+mod cid_font_width_tests {
+    use super::*;
+    use lopdf::content::{Content, Operation};
+
+    /// Build a one-page PDF with a single Type0/CIDFontType2 font and draw `text_bytes`
+    /// (2-byte-per-CID, Identity-H) via `Tj`. `w_entries` are `/W` triplets in the
+    /// `c_first c_last w` form -- the only form Typst's PDF writer emits, always with
+    /// `c_first == c_last` for a single glyph's width.
+    fn build_pdf(w_entries: &[(i64, i64, f64)], default_width: i64, text_bytes: &[u8]) -> Vec<u8> {
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+
+        let descriptor = Dictionary::new();
+        let descriptor_id = doc.add_object(descriptor);
+
+        let w_array: Vec<Object> = w_entries
+            .iter()
+            .flat_map(|&(first, last, width)| vec![first.into(), last.into(), width.into()])
+            .collect();
+
+        let mut cid_font = Dictionary::new();
+        cid_font.set("Type", "Font");
+        cid_font.set("Subtype", "CIDFontType2");
+        cid_font.set("BaseFont", "Synthetic");
+        cid_font.set("FontDescriptor", Object::Reference(descriptor_id));
+        cid_font.set("DW", default_width);
+        cid_font.set("W", Object::Array(w_array));
+        let cid_font_id = doc.add_object(cid_font);
+
+        let mut font = Dictionary::new();
+        font.set("Type", "Font");
+        font.set("Subtype", "Type0");
+        font.set("BaseFont", "Synthetic");
+        font.set("Encoding", "Identity-H");
+        font.set("DescendantFonts", Object::Array(vec![Object::Reference(cid_font_id)]));
+        let font_id = doc.add_object(font);
+
+        let mut fonts = Dictionary::new();
+        fonts.set("F1", Object::Reference(font_id));
+        let mut resources = Dictionary::new();
+        resources.set("Font", Object::Dictionary(fonts));
+        let resources_id = doc.add_object(resources);
+
+        let operations = vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), 12.into()]),
+            Operation::new("Tj", vec![Object::String(text_bytes.to_vec(), lopdf::StringFormat::Literal)]),
+            Operation::new("ET", vec![]),
+        ];
+        let content = Content { operations };
+        let content_id = doc.add_object(Stream::new(Dictionary::new(), content.encode().unwrap()));
+
+        let mut page = Dictionary::new();
+        page.set("Type", "Page");
+        page.set("Parent", Object::Reference(pages_id));
+        page.set("Contents", Object::Reference(content_id));
+        page.set("Resources", Object::Reference(resources_id));
+        page.set("MediaBox", Object::Array(vec![0.into(), 0.into(), 612.into(), 792.into()]));
+        let page_id = doc.add_object(page);
+
+        let mut pages = Dictionary::new();
+        pages.set("Type", "Pages");
+        pages.set("Kids", Object::Array(vec![Object::Reference(page_id)]));
+        pages.set("Count", 1);
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", "Catalog");
+        catalog.set("Pages", Object::Reference(pages_id));
+        let catalog_id = doc.add_object(catalog);
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).unwrap();
+        buf
+    }
+
+    struct WidthRecorder {
+        widths: Vec<f64>,
+    }
+
+    impl OutputDev for WidthRecorder {
+        fn begin_page(&mut self, _page_num: u32, _media_box: &MediaBox, _art_box: Option<(f64, f64, f64, f64)>) -> Result<(), OutputError> {Ok(())}
+        fn end_page(&mut self) -> Result<(), OutputError> {Ok(())}
+        fn output_character(&mut self, _trm: &Transform, width: f64, _spacing: f64, _font_size: f64, _char: &str) -> Result<(), OutputError> {
+            self.widths.push(width);
+            Ok(())
+        }
+        fn begin_word(&mut self) -> Result<(), OutputError> {Ok(())}
+        fn end_word(&mut self) -> Result<(), OutputError> {Ok(())}
+        fn end_line(&mut self) -> Result<(), OutputError> {Ok(())}
+    }
+
+    fn record_widths(pdf: &[u8]) -> Vec<f64> {
+        let doc = Document::load_mem(pdf).expect("load synthetic pdf");
+        let mut rec = WidthRecorder { widths: vec![] };
+        output_doc(&doc, &mut rec).expect("process synthetic pdf");
+        rec.widths
+    }
+
+    /// Typst (and other PDF writers) emit every glyph's width as a `c c w` triplet
+    /// -- a "range" of exactly one CID -- rather than the compact array form. With
+    /// `/DW 0`, a dropped entry silently reads back as exactly zero width instead of
+    /// panicking or erroring, which is why this went unnoticed: text still extracts
+    /// (positions still advance via inter-string TJ kerning) but accumulated
+    /// glyph-width measurements collapse to ~0.
+    #[test]
+    fn singleton_range_w_entries_are_not_dropped() {
+        let pdf = build_pdf(&[(1, 1, 706.0), (2, 2, 551.0)], 0, &[0, 1, 0, 2]);
+        assert_eq!(record_widths(&pdf), vec![0.706, 0.551]);
+    }
+
+    /// A true multi-CID range (`c_first != c_last`) is valid per spec even though
+    /// Typst never emits one; this exercises the c_last/c_width off-by-one-index
+    /// bug independently of the empty-range bug above.
+    #[test]
+    fn multi_glyph_range_w_entry_covers_inclusive_span() {
+        let pdf = build_pdf(&[(1, 3, 500.0)], 0, &[0, 1, 0, 2, 0, 3]);
+        assert_eq!(record_widths(&pdf), vec![0.5, 0.5, 0.5]);
+    }
+}
